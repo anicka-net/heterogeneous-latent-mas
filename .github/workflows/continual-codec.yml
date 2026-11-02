@@ -1,0 +1,30 @@
+name: Continual codec CPU smoke tests
+
+on:
+  push:
+    branches:
+      - experiment/intermittent-codec-training
+  pull_request:
+    paths:
+      - "train_vision_latent_mas_codec_new.py"
+      - "scripts/continual_codec.py"
+      - "tests/test_continual_codec.py"
+      - ".github/workflows/continual-codec.yml"
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile source without importing GPU dependencies
+        run: |
+          python -m py_compile scripts/continual_codec.py train_vision_latent_mas_codec_new.py tests/test_continual_codec.py
+      - name: Run CPU-only unit tests
+        run: python -m unittest discover -s tests -p 'test_continual_codec.py' -v
