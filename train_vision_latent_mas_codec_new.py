@@ -1353,6 +1353,8 @@ def _train_one_model(
     dummy_imgs: List[Image.Image],
     anchor_texts: List[str],
     cfg: argparse.Namespace,
+    initial_encoder_state: Optional[Dict[str, torch.Tensor]] = None,
+    initial_decoder_state: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]:
                                                                    
 
@@ -1402,6 +1404,17 @@ def _train_one_model(
     ).to(device=device, dtype=codec_dtype)
 
                                                                       
+    # Restore codec weights before DDP wrapping and optimizer initialization.
+    # The optimizer starts fresh each burst: this is warm-starting, not
+    # bit-for-bit mid-epoch training resumption.
+    if (initial_encoder_state is None) != (initial_decoder_state is None):
+        raise ValueError("Both encoder and decoder states are required to warm-start")
+    if initial_encoder_state is not None:
+        enc.load_state_dict(initial_encoder_state, strict=True)
+        dec.load_state_dict(initial_decoder_state, strict=True)
+        if _ddp_rank() == 0:
+            print(f"[codec-train] Warm-started {wrapper.model_name}", flush=True)
+
     if _ddp_is_active() and torch.cuda.is_available():
         enc = nn.parallel.DistributedDataParallel(enc, device_ids=[device.index] if device.type == "cuda" else None)
         dec = nn.parallel.DistributedDataParallel(dec, device_ids=[device.index] if device.type == "cuda" else None)
@@ -1867,6 +1880,10 @@ def main() -> None:
     p.add_argument("--model_name", type=str, default="", help="Single model name")
     p.add_argument("--agent_model_names", type=str, default="", help="Comma-separated model names")
     p.add_argument("--vision_codec_path", type=str, required=True, help="Where to save the codec checkpoint")
+    p.add_argument(
+        "--vision_codec_resume_path", type=str, default="",
+        help="Full codec checkpoint to warm-start; optimizer state is reset each burst.",
+    )
     p.add_argument("--seed", type=int, default=42)
 
                                                
@@ -2078,6 +2095,28 @@ def main() -> None:
     target_ref_idx = max(0, min(int(args.vision_codec_ref_idx), len(model_names) - 1))
     target_ref_name = model_names[target_ref_idx]
 
+    resume_ckpt = None
+    resume_path = (args.vision_codec_resume_path or "").strip()
+    if resume_path:
+        if os.path.abspath(resume_path) == os.path.abspath(args.vision_codec_path):
+            raise ValueError("Resume input and output must differ; keep the parent checkpoint immutable")
+        resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=True)
+        if not isinstance(resume_ckpt, dict) or resume_ckpt.get("version") != 2 or resume_ckpt.get("is_partial", True):
+            raise ValueError("Resume requires a complete version-2 codec checkpoint")
+        if list(resume_ckpt.get("models", [])) != list(model_names):
+            raise ValueError(f"Resume model order mismatch: {resume_ckpt.get('models')} != {model_names}")
+        if resume_ckpt.get("ref_model_name") != target_ref_name:
+            raise ValueError("Resume reference model mismatch; preserve --vision_codec_ref_idx")
+        prior_cfg = resume_ckpt.get("config", {})
+        current_cfg = _codec_config_from_args(args)
+        if prior_cfg != current_cfg:
+            raise ValueError(f"Resume codec architecture mismatch: {prior_cfg} != {current_cfg}")
+        for name in model_names:
+            if name not in resume_ckpt.get("encoders", {}) or name not in resume_ckpt.get("decoders", {}):
+                raise ValueError(f"Resume checkpoint missing encoder/decoder for {name}")
+        if _ddp_rank() == 0:
+            print(f"[codec-train] Resuming codecs from {resume_path}", flush=True)
+
     partial_ckpt_path = ""
     if int(args.vision_codec_save_per_model) == 1:
         partial_ckpt_path = (args.vision_codec_partial_ckpt_path or "").strip() or _derive_partial_ckpt_path(args.vision_codec_path)
@@ -2117,6 +2156,8 @@ def main() -> None:
             dummy_imgs=dummy_imgs,
             anchor_texts=anchor_texts,
             cfg=args,
+            initial_encoder_state=(resume_ckpt["encoders"][name] if resume_ckpt else None),
+            initial_decoder_state=(resume_ckpt["decoders"][name] if resume_ckpt else None),
         )
 
         if _ddp_rank() == 0:
@@ -2280,6 +2321,15 @@ def main() -> None:
             align=align,
             is_partial=False,
         )
+        # Optional metadata: existing v2 inference readers ignore extra keys.
+        history = list(resume_ckpt.get("continual_history", [])) if resume_ckpt else []
+        history.append({
+            "parent": resume_path or None,
+            "steps_per_model": int(args.vision_codec_train_steps),
+            "anchors": len(anchor_texts),
+            "seed": int(args.seed),
+        })
+        ckpt["continual_history"] = history
         _atomic_torch_save(ckpt, args.vision_codec_path)
         print(f"\nSaved codec checkpoint to: {args.vision_codec_path}")
 
